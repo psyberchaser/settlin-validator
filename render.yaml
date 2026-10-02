@@ -1,0 +1,25 @@
+# One-click-ish blueprint for an independent operator. Deploy in YOUR OWN Render account.
+# Set every sync:false value in the dashboard; VALIDATOR_KEY never leaves your host/account.
+services:
+  - type: web
+    name: settlin-validator
+    runtime: node
+    plan: starter
+    buildCommand: npm install
+    startCommand: node service.mjs
+    healthCheckPath: /health
+    envVars:
+      - key: VALIDATOR_KEY
+        sync: false
+      - key: DELIVERY_ATTESTOR_ADDRESS
+        value: "0x3Fb200cFbD2965B72A6210783B0d66051A222CfD"
+      - key: ATTESTOR_RPC
+        sync: false
+      - key: SOLANA_RPC
+        sync: false
+      - key: VALIDATOR_AUTH_TOKEN
+        sync: false
+      - key: PORT
+        value: "8800"
+      - key: HOST
+        value: "0.0.0.0"
