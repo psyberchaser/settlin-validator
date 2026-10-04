@@ -32,7 +32,7 @@
 
 import http from "node:http";
 import { ethers } from "ethers";
-import { makeOnchainVerifier } from "./verify-delivery.mjs";
+import { makeOnchainVerifier, makeExpectationReader, checkSourceExpectation } from "./verify-delivery.mjs";
 
 // Only what this service reads from the DeliveryAttestor: the authoritative digest (v2 + legacy v1).
 const DELIVERY_ATTESTOR_ABI = [
@@ -68,10 +68,12 @@ function readBody(req, maxBytes = 64 * 1024) {
  * @param {string} opts.attestorAddress
  * @param {import('ethers').Provider} opts.attestorProvider
  * @param {(claim:object)=>Promise<{ok:boolean,reason?:string}>} opts.verifyDelivery
+ * @param {(intentId:string)=>Promise<object|null>} [opts.readExpectation] C-01 (v8): source pool's
+ *   expected-delivery commitment reader; a claim that does not satisfy it is refused before signing.
  * @param {string} [opts.authToken]
  */
 export function createValidatorService(opts) {
-  const { signer, attestorAddress, attestorProvider, verifyDelivery, authToken } = opts;
+  const { signer, attestorAddress, attestorProvider, verifyDelivery, readExpectation, authToken } = opts;
   if (!signer?.address || typeof signer.signDigest !== "function") throw new Error("createValidatorService needs a signer {address, signDigest}");
   if (!attestorAddress) throw new Error("createValidatorService needs attestorAddress");
   if (!attestorProvider) throw new Error("createValidatorService needs attestorProvider");
@@ -104,6 +106,17 @@ export function createValidatorService(opts) {
 
       const verdict = await verifyDelivery(claim);
       if (!verdict?.ok) { stats.declined++; return json(res, 409, { error: `delivery not verified: ${verdict?.reason || "unknown"}` }); }
+
+      // C-01 (v8): the payout is real — but is it the payout the SOURCE intent requires? Read the pool's
+      // expected-delivery commitment (set when the SP1 proof verified) and refuse anything else, so a
+      // relayer cannot steer this validator into attesting a real-but-wrong payout.
+      if (readExpectation) {
+        let x;
+        try { x = await readExpectation(claim.intentId); }
+        catch (e) { stats.errors++; return json(res, 502, { error: `source expectation read failed: ${e.message}` }); }
+        const why = checkSourceExpectation(claim, x);
+        if (why) { stats.declined++; return json(res, 409, { error: `delivery does not match the source commitment: ${why}` }); }
+      }
 
       let digest;
       try {
@@ -165,9 +178,12 @@ async function main() {
   if (!env.VALIDATOR_AUTH_TOKEN && env.VALIDATOR_ALLOW_OPEN !== "true") {
     throw new Error("M-06: VALIDATOR_AUTH_TOKEN is required (or set VALIDATOR_ALLOW_OPEN=true for local dev only). /attest must not be publicly open.");
   }
+  // C-01 (v8): bind every signature to the source pool's expected-delivery commitment (pool address is
+  // read from the attestor). Compatible with a pre-v8 pool (no commitment API → check skipped).
+  const readExpectation = makeExpectationReader({ attestorAddress, provider: attestorProvider });
   const port = Number(env.PORT || 8800);
   const { url, address } = await startValidatorService(
-    { signer, attestorAddress, attestorProvider, verifyDelivery, authToken: env.VALIDATOR_AUTH_TOKEN },
+    { signer, attestorAddress, attestorProvider, verifyDelivery, readExpectation, authToken: env.VALIDATOR_AUTH_TOKEN },
     port,
     env.HOST || "0.0.0.0",
   );

@@ -34,6 +34,66 @@ function scaleToInt(amount, scale) {
   return ethers.parseUnits(Number(amount).toFixed(decimals), decimals);
 }
 
+// ── C-01 (v8): source-side expected-delivery commitment ─────────────────────────────────────────
+// bindCheck + the on-chain check prove the claim describes a REAL payout — but the relayer chooses
+// which payout to describe. A compromised relayer could pay attacker X and ask honest validators to
+// attest that real-but-wrong payout under a legitimate intentId. So, before signing, a validator also
+// reads the SOURCE pool's expected-delivery commitment (written when the SP1 proof verified) and
+// refuses any claim that does not satisfy it. The pool enforces the same predicate on-chain
+// (SettlementProofLib.requireDelivered); this makes honest validators refuse up front as well.
+export const POOL_EXPECTATION_ABI = [
+  "function deliveryExpectation(bytes32) view returns (bytes32 recipientHash, uint256 destAmount, uint64 destChainId, uint8 finality, bool set)",
+  "function expectedDeliveryAsset(uint256) view returns (bytes32)",
+];
+
+/**
+ * Pure decision: does the claim satisfy the source pool's expected-delivery commitment?
+ * @param {object} claim { recipient, amount, asset, finality } (the bound digest fields)
+ * @param {object|null} x  { set, recipientHash, destAmount, finality, asset } — null = the pool
+ *   predates v8 (no commitment API), so there is nothing to check (pre-upgrade compatibility).
+ * @returns {string|null} a refusal reason, or null when the claim matches.
+ */
+export function checkSourceExpectation(claim, x) {
+  if (!x) return null;
+  if (!x.set) return "no expected-delivery commitment on the source pool (proof not committed)";
+  try {
+    if (ethers.hexlify(claim.recipient) !== ethers.hexlify(x.recipientHash)) return "recipient differs from the source intent's committed recipient";
+    if (BigInt(claim.amount) < BigInt(x.destAmount)) return "amount below the source proof's committed destination amount";
+    if (Number(claim.finality) < Number(x.finality)) return "finality below the source commitment";
+    if (x.asset && x.asset !== ethers.ZeroHash && ethers.hexlify(claim.asset) !== ethers.hexlify(x.asset)) return "asset differs from the corridor's expected asset";
+  } catch (e) {
+    return `source-expectation check error: ${e.message}`;
+  }
+  return null;
+}
+
+// A pre-v8 pool has no deliveryExpectation(): the call reverts with no data (or returns undecodable
+// empty data). Anything else — RPC/network failures, real reverts — must propagate (fail closed).
+function isMissingFunction(e) {
+  return e?.code === "BAD_DATA" || (e?.code === "CALL_EXCEPTION" && (!e.data || e.data === "0x"));
+}
+
+/**
+ * On-chain reader for the source commitment. The pool address is read from the attestor itself
+ * (attestor.pool()), so validators need no extra configuration.
+ * @returns {(intentId:string)=>Promise<object|null>} null when the pool predates v8.
+ */
+export function makeExpectationReader({ attestorAddress, provider }) {
+  const att = new ethers.Contract(attestorAddress, ["function pool() view returns (address)"], provider);
+  let poolP;
+  return async (intentId) => {
+    poolP ??= att.pool()
+      .then((a) => new ethers.Contract(a, POOL_EXPECTATION_ABI, provider))
+      .catch((e) => { poolP = undefined; throw e; }); // don't cache a transient failure
+    const pool = await poolP;
+    let r;
+    try { r = await pool.deliveryExpectation(intentId); }
+    catch (e) { if (isMissingFunction(e)) return null; throw e; }
+    const asset = r.set ? await pool.expectedDeliveryAsset(r.destChainId) : ethers.ZeroHash;
+    return { set: r.set, recipientHash: r.recipientHash, destAmount: r.destAmount, destChainId: r.destChainId, finality: r.finality, asset };
+  };
+}
+
 function bindCheck(claim) {
   const raw = claim.raw;
   if (!raw) return "no raw delivery facts in claim (cannot verify independently)";
