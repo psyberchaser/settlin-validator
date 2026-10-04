@@ -20,10 +20,19 @@
 
 import { ethers } from "ethers";
 
-// Allow for integer rounding in the scaled-amount commitment and sub-unit fee dust: the delivered
-// amount must be at least this fraction of the claimed amount. Deliveries are exact (the relayer sends
-// the quoted amount), so this only absorbs rounding, not slippage.
-const AMOUNT_FLOOR_BPS = 9950n; // 99.50%
+// H-06: a validator must NEVER attest more than it observed. The delivered amount must be at least the
+// FULL claimed amount (100%) — there is no tolerance in the evidence layer. Any product-level slippage
+// belongs in the intent / minDestAmount and the on-chain digest, not in a hidden validator fudge factor.
+const AMOUNT_FLOOR_BPS = 10000n; // 100% — delivered must be >= the exact signed amount
+
+// M-03: integer-precise scaling. NEVER multiply a float by the scale (Number loses precision above 2^53
+// and rounds high-decimal values). Treat the scale as a decimal exponent and parse fixed-point, so the
+// relayer's committed amount and the validator's recomputation agree exactly, bit-for-bit.
+function scaleToInt(amount, scale) {
+  const decimals = Math.round(Math.log10(Number(scale)));
+  // toFixed(decimals) pins to the smallest unit; parseUnits yields the exact integer with no float mul.
+  return ethers.parseUnits(Number(amount).toFixed(decimals), decimals);
+}
 
 function bindCheck(claim) {
   const raw = claim.raw;
@@ -33,8 +42,7 @@ function bindCheck(claim) {
     if (ethers.hexlify(claim.recipient) !== ethers.hexlify(rHash)) return "recipient hash mismatch";
     const aHash = ethers.keccak256(ethers.toUtf8Bytes(String(raw.assetSymbol)));
     if (ethers.hexlify(claim.asset) !== ethers.hexlify(aHash)) return "asset hash mismatch";
-    const scale = Number(raw.amountScale || 1e9);
-    const boundAmount = BigInt(Math.round(Number(raw.amount) * scale));
+    const boundAmount = scaleToInt(raw.amount, raw.amountScale || 1e9);
     if (BigInt(claim.amount) !== boundAmount) return "amount commitment mismatch";
   } catch (e) {
     return `bind-check error: ${e.message}`;
@@ -71,10 +79,10 @@ async function verifySolana(raw, connMod, rpcUrl, requireFinalized) {
   const deliveredLamports = post - pre;
   if (deliveredLamports <= 0n) return { ok: false, reason: "recipient balance did not increase" };
 
-  const expectedLamports = BigInt(Math.round(Number(raw.amount) * LAMPORTS_PER_SOL));
-  const floor = (expectedLamports * AMOUNT_FLOOR_BPS) / 10000n;
+  const expectedLamports = scaleToInt(raw.amount, LAMPORTS_PER_SOL); // M-03: integer-precise
+  const floor = (expectedLamports * AMOUNT_FLOOR_BPS) / 10000n;      // H-06: == expected (100%)
   if (deliveredLamports < floor) {
-    return { ok: false, reason: `delivered ${deliveredLamports} lamports < floor ${floor} (expected ${expectedLamports})` };
+    return { ok: false, reason: `delivered ${deliveredLamports} lamports < required ${floor} (expected ${expectedLamports})` };
   }
   return { ok: true, detail: { deliveredLamports: deliveredLamports.toString(), expectedLamports: expectedLamports.toString() } };
 }
