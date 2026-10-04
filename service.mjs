@@ -159,6 +159,12 @@ async function main() {
   if (env.EVM_RPC && !evmRpc.ethereum) evmRpc.ethereum = env.EVM_RPC;
   const verifyDelivery = makeOnchainVerifier({ evmRpc, solanaRpc: env.SOLANA_RPC });
 
+  // M-06: a validator signing service must NOT be open to the public — /attest is a high-value signing
+  // endpoint (DoS + signature-harvesting surface). Require a bearer token unless explicitly opted into
+  // open mode for local dev.
+  if (!env.VALIDATOR_AUTH_TOKEN && env.VALIDATOR_ALLOW_OPEN !== "true") {
+    throw new Error("M-06: VALIDATOR_AUTH_TOKEN is required (or set VALIDATOR_ALLOW_OPEN=true for local dev only). /attest must not be publicly open.");
+  }
   const port = Number(env.PORT || 8800);
   const { url, address } = await startValidatorService(
     { signer, attestorAddress, attestorProvider, verifyDelivery, authToken: env.VALIDATOR_AUTH_TOKEN },
