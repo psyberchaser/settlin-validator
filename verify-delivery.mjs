@@ -44,6 +44,9 @@ function scaleToInt(amount, scale) {
 export const POOL_EXPECTATION_ABI = [
   "function deliveryExpectation(bytes32) view returns (bytes32 recipientHash, uint256 destAmount, uint64 destChainId, uint8 finality, bool set)",
   "function expectedDeliveryAsset(uint256) view returns (bytes32)",
+  "function committedToSettle(bytes32) view returns (bool)",
+  "function intents(bytes32) view returns (bytes32 id, address sender, address token, uint256 amount, uint256 destChainId, bytes destAddress, bytes destToken, uint256 minDestAmount, uint256 deadline, bool executed, bool refunded)",
+  "function REQUIRED_FINALITY() view returns (uint8)",
 ];
 
 /**
@@ -89,8 +92,15 @@ export function makeExpectationReader({ attestorAddress, provider }) {
     let r;
     try { r = await pool.deliveryExpectation(intentId); }
     catch (e) { if (isMissingFunction(e)) return null; throw e; }
-    const asset = r.set ? await pool.expectedDeliveryAsset(r.destChainId) : ethers.ZeroHash;
-    return { set: r.set, recipientHash: r.recipientHash, destAmount: r.destAmount, destChainId: r.destChainId, finality: r.finality, asset };
+    let x = { set: r.set, recipientHash: r.recipientHash, destAmount: r.destAmount, destChainId: r.destChainId, finality: r.finality };
+    if (!r.set && (await pool.committedToSettle(intentId))) {
+      // Mirror SettlementProofLib._expected: an intent committed by a pre-v8 pool has no stored
+      // commitment — derive it from the intent's own immutable fields (never the SP1 verifier record).
+      const it = await pool.intents(intentId);
+      x = { set: true, recipientHash: ethers.keccak256(it.destAddress), destAmount: it.minDestAmount, destChainId: it.destChainId, finality: await pool.REQUIRED_FINALITY() };
+    }
+    x.asset = x.set ? await pool.expectedDeliveryAsset(x.destChainId) : ethers.ZeroHash;
+    return x;
   };
 }
 
