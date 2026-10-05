@@ -34,6 +34,14 @@ function scaleToInt(amount, scale) {
   return ethers.parseUnits(Number(amount).toFixed(decimals), decimals);
 }
 
+// M-02 (v8): the relayer now ships the settlement-authoritative amount as an exact smallest-unit integer
+// string (raw.amountUnits) — the same value it paid and proved. Use it verbatim; only claims from a relayer
+// that predates it fall back to the decimal parse.
+function unitsOf(raw, scale) {
+  if (raw.amountUnits != null) return BigInt(raw.amountUnits);
+  return scaleToInt(raw.amount, scale);
+}
+
 // ── C-01 (v8): source-side expected-delivery commitment ─────────────────────────────────────────
 // bindCheck + the on-chain check prove the claim describes a REAL payout — but the relayer chooses
 // which payout to describe. A compromised relayer could pay attacker X and ask honest validators to
@@ -112,7 +120,7 @@ function bindCheck(claim) {
     if (ethers.hexlify(claim.recipient) !== ethers.hexlify(rHash)) return "recipient hash mismatch";
     const aHash = ethers.keccak256(ethers.toUtf8Bytes(String(raw.assetSymbol)));
     if (ethers.hexlify(claim.asset) !== ethers.hexlify(aHash)) return "asset hash mismatch";
-    const boundAmount = scaleToInt(raw.amount, raw.amountScale || 1e9);
+    const boundAmount = unitsOf(raw, raw.amountScale || 1e9); // M-02: exact units when present
     if (BigInt(claim.amount) !== boundAmount) return "amount commitment mismatch";
   } catch (e) {
     return `bind-check error: ${e.message}`;
@@ -149,7 +157,7 @@ async function verifySolana(raw, connMod, rpcUrl, requireFinalized) {
   const deliveredLamports = post - pre;
   if (deliveredLamports <= 0n) return { ok: false, reason: "recipient balance did not increase" };
 
-  const expectedLamports = scaleToInt(raw.amount, LAMPORTS_PER_SOL); // M-03: integer-precise
+  const expectedLamports = unitsOf(raw, LAMPORTS_PER_SOL); // M-02/M-03: exact units when present
   const floor = (expectedLamports * AMOUNT_FLOOR_BPS) / 10000n;      // H-06: == expected (100%)
   if (deliveredLamports < floor) {
     return { ok: false, reason: `delivered ${deliveredLamports} lamports < required ${floor} (expected ${expectedLamports})` };
@@ -172,7 +180,7 @@ async function verifyEvm(raw, provider, requireFinalized) {
   try { recipient = ethers.getAddress(String(raw.recipient)); } catch { return { ok: false, reason: "bad evm recipient address" }; }
   if (!txn.to || ethers.getAddress(txn.to) !== recipient) return { ok: false, reason: "evm tx recipient mismatch (native transfer expected)" };
 
-  const expectedWei = ethers.parseEther(String(raw.amount));
+  const expectedWei = raw.amountUnits != null ? BigInt(raw.amountUnits) : ethers.parseEther(String(raw.amount)); // M-02
   const floor = (expectedWei * AMOUNT_FLOOR_BPS) / 10000n;
   if (txn.value < floor) return { ok: false, reason: `evm value ${txn.value} < floor ${floor} (expected ${expectedWei})` };
 
