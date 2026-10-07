@@ -112,9 +112,9 @@ export function createValidatorService(opts) {
       // relayer cannot steer this validator into attesting a real-but-wrong payout.
       if (readExpectation) {
         let x;
-        try { x = await readExpectation(claim.intentId); }
+        try { x = await readExpectation(claim.intentId, claim.destTxHash); }
         catch (e) { stats.errors++; return json(res, 502, { error: `source expectation read failed: ${e.message}` }); }
-        const why = checkSourceExpectation(claim, x);
+        const why = checkSourceExpectation(claim, x); // v9 C-01: + chain binding + on-chain receipt use
         if (why) { stats.declined++; return json(res, 409, { error: `delivery does not match the source commitment: ${why}` }); }
       }
 

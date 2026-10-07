@@ -49,6 +49,30 @@ function unitsOf(raw, scale) {
 // reads the SOURCE pool's expected-delivery commitment (written when the SP1 proof verified) and
 // refuses any claim that does not satisfy it. The pool enforces the same predicate on-chain
 // (SettlementProofLib.requireDelivered); this makes honest validators refuse up front as well.
+// ── v9 C-01: observation identity ─────────────────────────────────────────────────────────────────
+// What a validator signs must be exactly what it fetched. Destination chains this validator can verify,
+// their source-side chain id (as stored in the intent's destChainId) and the ONLY asset a native
+// balance delta can prove (a native transfer can't attest a token, so a relabelled asset is refused).
+export const DEST_CHAINS = {
+  solana: { chainId: 1399811149n, native: "SOL" },
+  ethereum: { chainId: 1n, native: "ETH" },
+  arbitrum: { chainId: 42161n, native: "ETH" },
+  polygon: { chainId: 137n, native: "MATIC" },
+  avalanche: { chainId: 43114n, native: "AVAX" },
+};
+
+/** Canonical receipt id the relayer binds as destTxHash (mirrors multi-chain-relayer.mjs exactly). */
+export function destTxHashFor(destTx) {
+  const t = String(destTx || "");
+  return t.startsWith("0x") ? t.slice(0, 66).padEnd(66, "0").toLowerCase() : ethers.keccak256(ethers.toUtf8Bytes(t));
+}
+
+// Explicit intent linkage: every attested payout names the ONE intent it settles — a Solana SPL Memo v2
+// instruction (or EVM calldata) equal to the lowercase intentId. A payment can then only be evidence
+// for that intent: older payments, third-party transfers and duplicate payouts (no / other memo) are
+// refused, independent of timing. The attestor's single-use receipts back this up on-chain.
+export const MEMO_PROGRAM_IDS = new Set(["MemoSq4gqABAXKb96qnH8TysNcWxMyWCqXgDLGmfcHr", "Memo1UhkJRfHyvLMcVucJwxXeuD728EqVDDwQDxFMNo"]);
+
 export const POOL_EXPECTATION_ABI = [
   "function deliveryExpectation(bytes32) view returns (bytes32 recipientHash, uint256 destAmount, uint64 destChainId, uint8 finality, bool set)",
   "function expectedDeliveryAsset(uint256) view returns (bytes32)",
@@ -68,6 +92,13 @@ export function checkSourceExpectation(claim, x) {
   if (!x) return null;
   if (!x.set) return "no expected-delivery commitment on the source pool (proof not committed)";
   try {
+    // v9 C-01: the observed destination chain must be the intent's committed destination chain.
+    const dc = DEST_CHAINS[String(claim.raw?.destChain || "").toLowerCase()];
+    if (!dc) return `unknown destination chain '${claim.raw?.destChain}'`;
+    if (dc.chainId !== BigInt(x.destChainId)) return "destination chain differs from the source intent's committed chain";
+    // v9 C-01: a receipt already consumed by another intent can never be attested again.
+    if (x.receiptUsedBy && x.receiptUsedBy !== ethers.ZeroHash && x.receiptUsedBy.toLowerCase() !== String(claim.intentId).toLowerCase())
+      return "destination receipt already backs another intent";
     if (ethers.hexlify(claim.recipient) !== ethers.hexlify(x.recipientHash)) return "recipient differs from the source intent's committed recipient";
     if (BigInt(claim.amount) < BigInt(x.destAmount)) return "amount below the source proof's committed destination amount";
     if (Number(claim.finality) < Number(x.finality)) return "finality below the source commitment";
@@ -90,9 +121,9 @@ function isMissingFunction(e) {
  * @returns {(intentId:string)=>Promise<object|null>} null when the pool predates v8.
  */
 export function makeExpectationReader({ attestorAddress, provider }) {
-  const att = new ethers.Contract(attestorAddress, ["function pool() view returns (address)"], provider);
+  const att = new ethers.Contract(attestorAddress, ["function pool() view returns (address)", "function receiptUsedBy(bytes32) view returns (bytes32)"], provider);
   let poolP;
-  return async (intentId) => {
+  return async (intentId, destTxHash) => {
     poolP ??= att.pool()
       .then((a) => new ethers.Contract(a, POOL_EXPECTATION_ABI, provider))
       .catch((e) => { poolP = undefined; throw e; }); // don't cache a transient failure
@@ -108,6 +139,11 @@ export function makeExpectationReader({ attestorAddress, provider }) {
       x = { set: true, recipientHash: ethers.keccak256(it.destAddress), destAmount: it.minDestAmount, destChainId: it.destChainId, finality: await pool.REQUIRED_FINALITY() };
     }
     x.asset = x.set ? await pool.expectedDeliveryAsset(x.destChainId) : ethers.ZeroHash;
+    if (destTxHash) {
+      // v9 C-01: on-chain receipt consumption (an attestor that predates single-use receipts → skip).
+      try { x.receiptUsedBy = await att.receiptUsedBy(destTxHash); }
+      catch (e) { if (!isMissingFunction(e)) throw e; }
+    }
     return x;
   };
 }
@@ -122,6 +158,11 @@ function bindCheck(claim) {
     if (ethers.hexlify(claim.asset) !== ethers.hexlify(aHash)) return "asset hash mismatch";
     const boundAmount = unitsOf(raw, raw.amountScale || 1e9); // M-02: exact units when present
     if (BigInt(claim.amount) !== boundAmount) return "amount commitment mismatch";
+    // v9 C-01: the receipt id being signed must be the very transaction this validator fetches.
+    if (!claim.destTxHash || destTxHashFor(raw.destTx) !== String(claim.destTxHash).toLowerCase()) return "signed destTxHash does not match raw.destTx";
+    // v9 C-01: a native balance delta proves only the chain's native asset — refuse a relabelled asset.
+    const dc = DEST_CHAINS[String(raw.destChain || "").toLowerCase()];
+    if (dc && String(raw.assetSymbol) !== dc.native) return `asset '${raw.assetSymbol}' is not ${raw.destChain}'s native asset (${dc.native})`;
   } catch (e) {
     return `bind-check error: ${e.message}`;
   }
@@ -129,7 +170,7 @@ function bindCheck(claim) {
 }
 
 // ── Solana native payout ──────────────────────────────────────────────────────
-async function verifySolana(raw, connMod, rpcUrl, requireFinalized) {
+async function verifySolana(raw, connMod, rpcUrl, requireFinalized, intentId) {
   let Connection, PublicKey, LAMPORTS_PER_SOL;
   try {
     ({ Connection, PublicKey, LAMPORTS_PER_SOL } = connMod || (await import("@solana/web3.js")));
@@ -149,9 +190,22 @@ async function verifySolana(raw, connMod, rpcUrl, requireFinalized) {
   // Find the recipient's balance delta from pre/post balances.
   let recipientKey;
   try { recipientKey = new PublicKey(String(raw.recipient)); } catch { return { ok: false, reason: "bad solana recipient pubkey" }; }
-  const keys = tx.transaction.message.getAccountKeys ? tx.transaction.message.getAccountKeys().staticAccountKeys : tx.transaction.message.accountKeys;
+  // Full ordered key list (static + address-lookup-table loaded), matching pre/postBalances indexes.
+  // getAccountKeys() with no lookups THROWS for a v0 tx that uses lookup tables, so pass them in.
+  let keys;
+  try {
+    const m = tx.transaction.message;
+    keys = m.getAccountKeys ? m.getAccountKeys({ accountKeysFromLookups: tx.meta?.loadedAddresses }).keySegments().flat() : m.accountKeys;
+  } catch { keys = tx.transaction.message.staticAccountKeys || tx.transaction.message.accountKeys || []; }
   const idx = keys.findIndex((k) => k.equals(recipientKey));
   if (idx < 0) return { ok: false, reason: "recipient not an account in the tx" };
+  // v9 C-01: explicit intent linkage — exactly one memo instruction, equal to this intent's id.
+  const msg = tx.transaction.message;
+  const ixs = msg.compiledInstructions || msg.instructions || [];
+  const memos = ixs.filter((ix) => MEMO_PROGRAM_IDS.has(String(keys[ix.programIdIndex]?.toBase58?.() ?? keys[ix.programIdIndex])));
+  if (memos.length !== 1) return { ok: false, reason: `payout must carry exactly one intent memo (found ${memos.length})` };
+  const memo = Buffer.from(memos[0].data).toString("utf8").trim().toLowerCase();
+  if (memo !== String(intentId || "").toLowerCase()) return { ok: false, reason: "payout memo names a different intent" };
   const pre = BigInt(tx.meta.preBalances[idx]);
   const post = BigInt(tx.meta.postBalances[idx]);
   const deliveredLamports = post - pre;
@@ -166,7 +220,7 @@ async function verifySolana(raw, connMod, rpcUrl, requireFinalized) {
 }
 
 // ── EVM native payout ───────────────────────────────────────────────────────────
-async function verifyEvm(raw, provider, requireFinalized) {
+async function verifyEvm(raw, provider, requireFinalized, intentId) {
   let rcpt, txn;
   try {
     [rcpt, txn] = await Promise.all([provider.getTransactionReceipt(raw.destTx), provider.getTransaction(raw.destTx)]);
@@ -180,6 +234,8 @@ async function verifyEvm(raw, provider, requireFinalized) {
   try { recipient = ethers.getAddress(String(raw.recipient)); } catch { return { ok: false, reason: "bad evm recipient address" }; }
   if (!txn.to || ethers.getAddress(txn.to) !== recipient) return { ok: false, reason: "evm tx recipient mismatch (native transfer expected)" };
 
+  // v9 C-01: explicit intent linkage — the native transfer's calldata is exactly this intent's id.
+  if (String(txn.data || "0x").toLowerCase() !== String(intentId || "").toLowerCase()) return { ok: false, reason: "payout calldata does not name this intent" };
   const expectedWei = raw.amountUnits != null ? BigInt(raw.amountUnits) : ethers.parseEther(String(raw.amount)); // M-02
   const floor = (expectedWei * AMOUNT_FLOOR_BPS) / 10000n;
   if (txn.value < floor) return { ok: false, reason: `evm value ${txn.value} < floor ${floor} (expected ${expectedWei})` };
@@ -224,10 +280,10 @@ export function makeOnchainVerifier(cfg = {}) {
 
     if (chain === "solana") {
       if (!cfg.solanaRpc) return { ok: false, reason: "validator has no Solana RPC configured" };
-      return verifySolana(raw, cfg.solanaModule, cfg.solanaRpc, requireFinalized);
+      return verifySolana(raw, cfg.solanaModule, cfg.solanaRpc, requireFinalized, claim.intentId);
     }
     if (evmProviders[chain]) {
-      return verifyEvm(raw, evmProviders[chain], requireFinalized);
+      return verifyEvm(raw, evmProviders[chain], requireFinalized, claim.intentId);
     }
     if (chain === "bitcoin") return { ok: false, reason: "BTC payout verification not implemented — validator declines" };
     return { ok: false, reason: `validator cannot verify destination chain '${raw.destChain}'` };
