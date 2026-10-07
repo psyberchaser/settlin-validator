@@ -4,7 +4,7 @@
   "description": "Independent delivery-attestation validator for the Settlin bridge (C-01). Run by an independent operator on their own host and key; the relayer holds no validator key.",
   "type": "module",
   "license": "MIT",
-  "engines": { "node": ">=18" },
+  "engines": { "node": ">=22.12 <23" },
   "scripts": { "start": "node service.mjs" },
   "dependencies": {
     "ethers": "^6.16.0",

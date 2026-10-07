@@ -170,6 +170,13 @@ async function main() {
     if (m && v) evmRpc[m[1].toLowerCase()] = v;
   }
   if (env.EVM_RPC && !evmRpc.ethereum) evmRpc.ethereum = env.EVM_RPC;
+  // Fail fast if this validator can't load its Solana client. Otherwise every Solana payout is
+  // silently declined ("@solana/web3.js not available") and the quorum can never form. Seen in prod:
+  // Node < 22.12 can't require() the ESM-only deps of @solana/web3.js >= 1.98 (ERR_REQUIRE_ESM).
+  if (env.SOLANA_RPC) {
+    try { await import("@solana/web3.js"); }
+    catch (e) { throw new Error(`SOLANA_RPC is set but @solana/web3.js failed to load (${e.code || e.message}) — use Node >= 22.12`); }
+  }
   const verifyDelivery = makeOnchainVerifier({ evmRpc, solanaRpc: env.SOLANA_RPC });
 
   // M-06: a validator signing service must NOT be open to the public — /attest is a high-value signing
