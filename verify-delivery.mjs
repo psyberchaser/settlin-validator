@@ -8,7 +8,9 @@
 //      bound bytes32 the relayer is asking signatures over. This guarantees the signature the
 //      validator produces actually commits to the facts it verified (not some other digest).
 //        recipient(bytes32) == keccak256(utf8(raw.recipient))
-//        asset(bytes32)     == keccak256(utf8(raw.assetSymbol))
+//        asset(bytes32)     == the native asset of raw.destChain, as its v9 M-01 canonical id
+//                              keccak256(abi.encode(keccak256("settlin.asset.v1"), chainId, 0)) — or, until the
+//                              pool's registry is cut over, the legacy keccak256(utf8(raw.assetSymbol))
 //        amount(uint256)    == round(raw.amount * raw.amountScale)
 //
 //   2. On-chain check: look up raw.destTx on raw.destChain and confirm it delivered >= raw.amount of
@@ -61,6 +63,18 @@ export const DEST_CHAINS = {
   avalanche: { chainId: 43114n, native: "AVAX" },
 };
 
+// v9 M-01: canonical asset ids — chain + contract/mint identity, never a symbol (mirrors SettlementProofLib).
+export const ASSET_DOMAIN = ethers.id("settlin.asset.v1");
+export function canonicalAssetId(chainId, identity = ethers.ZeroHash) {
+  return ethers.keccak256(ethers.AbiCoder.defaultAbiCoder().encode(["bytes32", "uint256", "bytes32"], [ASSET_DOMAIN, BigInt(chainId), identity]));
+}
+/** The asset ids a native payout on `destChain` may be attested as: canonical (v9 M-01) or the legacy symbol hash. */
+export function nativeAssetIds(destChain) {
+  const dc = DEST_CHAINS[String(destChain || "").toLowerCase()];
+  if (!dc) return [];
+  return [canonicalAssetId(dc.chainId), ethers.keccak256(ethers.toUtf8Bytes(dc.native))].map((h) => h.toLowerCase());
+}
+
 /** Canonical receipt id the relayer binds as destTxHash (mirrors multi-chain-relayer.mjs exactly). */
 export function destTxHashFor(destTx) {
   const t = String(destTx || "");
@@ -76,6 +90,7 @@ export const MEMO_PROGRAM_IDS = new Set(["MemoSq4gqABAXKb96qnH8TysNcWxMyWCqXgDLG
 export const POOL_EXPECTATION_ABI = [
   "function deliveryExpectation(bytes32) view returns (bytes32 recipientHash, uint256 destAmount, uint64 destChainId, uint8 finality, bool set)",
   "function expectedDeliveryAsset(uint256) view returns (bytes32)",
+  "function intentDestAsset(bytes32) view returns (bytes32)", // v9 M-01 (absent on older pools)
   "function committedToSettle(bytes32) view returns (bool)",
   "function intents(bytes32) view returns (bytes32 id, address sender, address token, uint256 amount, uint256 destChainId, bytes destAddress, bytes destToken, uint256 minDestAmount, uint256 deadline, bool executed, bool refunded)",
   "function REQUIRED_FINALITY() view returns (uint8)",
@@ -138,7 +153,13 @@ export function makeExpectationReader({ attestorAddress, provider }) {
       const it = await pool.intents(intentId);
       x = { set: true, recipientHash: ethers.keccak256(it.destAddress), destAmount: it.minDestAmount, destChainId: it.destChainId, finality: await pool.REQUIRED_FINALITY() };
     }
-    x.asset = x.set ? await pool.expectedDeliveryAsset(x.destChainId) : ethers.ZeroHash;
+    // v9 M-01: mirror SettlementProofLib._intentAsset — the asset recorded for the intent at funding, else the
+    // corridor's registered asset. A pool that predates M-01 has no intentDestAsset() → registry only.
+    x.asset = ethers.ZeroHash;
+    if (x.set) {
+      try { x.asset = await pool.intentDestAsset(intentId); } catch (e) { if (!isMissingFunction(e)) throw e; }
+      if (x.asset === ethers.ZeroHash) x.asset = await pool.expectedDeliveryAsset(x.destChainId);
+    }
     if (destTxHash) {
       // v9 C-01: on-chain receipt consumption (an attestor that predates single-use receipts → skip).
       try { x.receiptUsedBy = await att.receiptUsedBy(destTxHash); }
@@ -148,14 +169,15 @@ export function makeExpectationReader({ attestorAddress, provider }) {
   };
 }
 
-function bindCheck(claim) {
+export function bindCheck(claim) {
   const raw = claim.raw;
   if (!raw) return "no raw delivery facts in claim (cannot verify independently)";
   try {
     const rHash = ethers.keccak256(ethers.toUtf8Bytes(String(raw.recipient)));
     if (ethers.hexlify(claim.recipient) !== ethers.hexlify(rHash)) return "recipient hash mismatch";
-    const aHash = ethers.keccak256(ethers.toUtf8Bytes(String(raw.assetSymbol)));
-    if (ethers.hexlify(claim.asset) !== ethers.hexlify(aHash)) return "asset hash mismatch";
+    // v9 M-01: the signed asset must be the destination chain's NATIVE asset — its canonical id, or the legacy
+    // symbol hash while the pool registry still holds it (checkSourceExpectation then pins it to the pool's value).
+    if (!nativeAssetIds(raw.destChain).includes(ethers.hexlify(claim.asset).toLowerCase())) return "asset is not the destination chain's native asset id";
     const boundAmount = unitsOf(raw, raw.amountScale || 1e9); // M-02: exact units when present
     if (BigInt(claim.amount) !== boundAmount) return "amount commitment mismatch";
     // v9 C-01: the receipt id being signed must be the very transaction this validator fetches.
