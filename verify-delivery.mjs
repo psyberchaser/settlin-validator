@@ -311,3 +311,88 @@ export function makeOnchainVerifier(cfg = {}) {
     return { ok: false, reason: `validator cannot verify destination chain '${raw.destChain}'` };
   };
 }
+
+// ── v12 H-03: SOURCE-side observation for the Solana → EVM corridor ───────────────────────────────────
+// The sol-tx-verify SP1 proof shows a correctly SIGNED Solana transfer message; it cannot show the transaction was
+// included, succeeded and finalized. Each validator observes the deposit on ITS OWN Solana RPC at FINALIZED commitment
+// and signs SP1SolInboundGate.sourceDigest(...) only for exactly the transfer the gate will authorize. The gate requires
+// a quorum of these signatures, so no single relayer / RPC view can authorize a payout for a deposit that never landed.
+export const SOL_SOURCE_TYPEHASH = ethers.id("SETTLIN_SOL_SOURCE_V1");
+const SYSTEM_PROGRAM = "11111111111111111111111111111111";
+
+/** Mirrors SP1SolInboundGate.sourceDigest exactly. */
+export function solSourceDigest({ chainId, gate, nullifier, sender, recipient, lamports, destChainId, destAddrHash }) {
+  return ethers.keccak256(ethers.AbiCoder.defaultAbiCoder().encode(
+    ["bytes32", "uint256", "address", "bytes32", "bytes32", "bytes32", "uint256", "uint256", "bytes32"],
+    [SOL_SOURCE_TYPEHASH, BigInt(chainId), gate, nullifier, sender, recipient, BigInt(lamports), BigInt(destChainId), destAddrHash]));
+}
+/** keccak256(sigHi || sigLo) of a base58 Solana signature — the gate's nullifier. */
+export function solNullifier(sigB58) {
+  return ethers.keccak256(ethers.toBeHex(ethers.decodeBase58(String(sigB58)), 64));
+}
+
+/**
+ * @param {object} cfg { solanaRpc, solanaModule?, depositAccount? (base58; when set, the only accepted recipient) }
+ * @returns {(req:object)=>Promise<{ok:boolean, reason?:string, facts?:object}>}
+ *   req: { solSignature, sender, depositAccount, lamports, destChainId, destAddress }
+ */
+export function makeSolSourceVerifier(cfg = {}) {
+  return async function verifySolSource(req) {
+    if (!cfg.solanaRpc) return { ok: false, reason: "validator has no Solana RPC configured" };
+    let Connection, PublicKey;
+    try { ({ Connection, PublicKey } = cfg.solanaModule || (await import("@solana/web3.js"))); }
+    catch { return { ok: false, reason: "@solana/web3.js not available on this validator" }; }
+    const deposit = String(req.depositAccount || "");
+    if (cfg.depositAccount && deposit !== cfg.depositAccount) return { ok: false, reason: "recipient is not this validator's configured Settlin deposit account" };
+    let lamports, destChainId;
+    try { lamports = BigInt(req.lamports); destChainId = BigInt(req.destChainId); } catch { return { ok: false, reason: "bad lamports / destChainId" }; }
+    if (lamports <= 0n) return { ok: false, reason: "zero lamports" };
+    const destAddress = String(req.destAddress || "");
+    if (!destAddress || destAddress.includes("|")) return { ok: false, reason: "bad destination address" };
+
+    const conn = new Connection(cfg.solanaRpc, "finalized");
+    let tx;
+    try { tx = await conn.getTransaction(String(req.solSignature), { commitment: "finalized", maxSupportedTransactionVersion: 0 }); }
+    catch (e) { return { ok: false, reason: `solana getTransaction failed: ${e.message}` }; }
+    if (!tx) return { ok: false, reason: "deposit not found at FINALIZED commitment (not finalized, or never landed)" };
+    if (tx.meta?.err) return { ok: false, reason: `deposit failed on-chain: ${JSON.stringify(tx.meta.err)}` };
+
+    let keys;
+    try {
+      const m = tx.transaction.message;
+      keys = m.getAccountKeys ? m.getAccountKeys({ accountKeysFromLookups: tx.meta?.loadedAddresses }).keySegments().flat() : m.accountKeys;
+    } catch { keys = tx.transaction.message.staticAccountKeys || tx.transaction.message.accountKeys || []; }
+    const b58 = (k) => String(k?.toBase58?.() ?? k);
+    const msg = tx.transaction.message;
+    const nSigners = Number(msg.header?.numRequiredSignatures ?? 1);
+    const senderIdx = keys.findIndex((k) => b58(k) === String(req.sender));
+    if (senderIdx < 0 || senderIdx >= nSigners) return { ok: false, reason: "the funding account did not sign the deposit" };
+
+    const ixs = msg.compiledInstructions || msg.instructions || [];
+    const accts = (ix) => ix.accountKeyIndexes || ix.accounts || [];
+    const data = (ix) => (typeof ix.data === "string" ? Buffer.from(ethers.getBytes(ethers.toBeHex(ethers.decodeBase58(ix.data)))) : Buffer.from(ix.data));
+    // Exactly one System transfer (the circuit reads the transfer instruction; more than one would be ambiguous).
+    const transfers = ixs.filter((ix) => b58(keys[ix.programIdIndex]) === SYSTEM_PROGRAM && data(ix).length >= 12 && data(ix).readUInt32LE(0) === 2);
+    if (transfers.length !== 1) return { ok: false, reason: `deposit must contain exactly one SOL transfer (found ${transfers.length})` };
+    const t = transfers[0], td = data(t);
+    const from = b58(keys[accts(t)[0]]), to = b58(keys[accts(t)[1]]), amt = td.readBigUInt64LE(4);
+    if (from !== String(req.sender)) return { ok: false, reason: "transfer is not from the funding account" };
+    if (to !== deposit) return { ok: false, reason: "transfer is not into the Settlin deposit account" };
+    if (amt !== lamports) return { ok: false, reason: `transfer moved ${amt} lamports, not ${lamports}` };
+    // Exactly one memo, exactly GHOST|<destChainId>|<destAddress> (token memos are refused — v11 C-01).
+    const memos = ixs.filter((ix) => MEMO_PROGRAM_IDS.has(b58(keys[ix.programIdIndex])));
+    if (memos.length !== 1) return { ok: false, reason: `deposit must carry exactly one memo (found ${memos.length})` };
+    if (data(memos[0]).toString("utf8") !== `GHOST|${destChainId}|${destAddress}`) return { ok: false, reason: "memo does not match the claimed destination" };
+    // The deposit account's balance really rose by at least the transfer.
+    const di = keys.findIndex((k) => b58(k) === deposit);
+    if (di < 0 || BigInt(tx.meta.postBalances[di]) - BigInt(tx.meta.preBalances[di]) < lamports) return { ok: false, reason: "deposit account balance did not increase by the transfer" };
+
+    let senderHex, depositHex;
+    try { senderHex = ethers.hexlify(new PublicKey(String(req.sender)).toBytes()); depositHex = ethers.hexlify(new PublicKey(deposit).toBytes()); }
+    catch { return { ok: false, reason: "bad Solana pubkey" }; }
+    return { ok: true, facts: {
+      nullifier: solNullifier(req.solSignature), sender: senderHex, recipient: depositHex, lamports,
+      destChainId, destAddrHash: ethers.keccak256(ethers.toUtf8Bytes(destAddress)),
+    } };
+  };
+}

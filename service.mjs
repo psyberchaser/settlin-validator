@@ -32,7 +32,7 @@
 
 import http from "node:http";
 import { ethers } from "ethers";
-import { makeOnchainVerifier, makeExpectationReader, checkSourceExpectation } from "./verify-delivery.mjs";
+import { makeOnchainVerifier, makeExpectationReader, checkSourceExpectation, makeSolSourceVerifier, solSourceDigest } from "./verify-delivery.mjs";
 
 // Only what this service reads from the DeliveryAttestor: the authoritative digest (v2 + legacy v1).
 const DELIVERY_ATTESTOR_ABI = [
@@ -73,7 +73,7 @@ function readBody(req, maxBytes = 64 * 1024) {
  * @param {string} [opts.authToken]
  */
 export function createValidatorService(opts) {
-  const { signer, attestorAddress, attestorProvider, verifyDelivery, readExpectation, authToken } = opts;
+  const { signer, attestorAddress, attestorProvider, verifyDelivery, readExpectation, authToken, verifySolSource } = opts;
   if (!signer?.address || typeof signer.signDigest !== "function") throw new Error("createValidatorService needs a signer {address, signDigest}");
   if (!attestorAddress) throw new Error("createValidatorService needs attestorAddress");
   if (!attestorProvider) throw new Error("createValidatorService needs attestorProvider");
@@ -97,6 +97,7 @@ export function createValidatorService(opts) {
       const url = (req.url || "").split("?")[0];
       if (req.method === "GET" && url === "/identity") return json(res, 200, { address: signer.address });
       if (req.method === "GET" && (url === "/health" || url === "/")) return json(res, 200, { status: "ok", ...stats });
+      if (req.method === "POST" && url === "/attest-sol-source") return attestSolSource(req, res);
       if (req.method !== "POST" || url !== "/attest") return json(res, 404, { error: "not found" });
       if (!authed(req)) { stats.declined++; return json(res, 401, { error: "unauthorized" }); }
 
@@ -136,6 +137,25 @@ export function createValidatorService(opts) {
       stats.errors++;
       try { return json(res, 500, { error: e.message || "internal error" }); } catch { /* sent */ }
     }
+  }
+
+  // v12 H-03: sign SP1SolInboundGate.sourceDigest(...) ONLY after observing the deposit FINALIZED and successful on this
+  // validator's own Solana RPC, moving exactly the claimed lamports from the claimed sender into the deposit account
+  // with the claimed GHOST memo. The digest is recomputed here from the OBSERVED facts — never taken from the caller.
+  async function attestSolSource(req, res) {
+    if (!authed(req)) { stats.declined++; return json(res, 401, { error: "unauthorized" }); }
+    if (typeof verifySolSource !== "function") return json(res, 501, { error: "this validator does not attest Solana source deposits (no SOLANA_RPC)" });
+    let body;
+    try { body = JSON.parse(await readBody(req)); } catch { return json(res, 400, { error: "bad json" }); }
+    if (!body?.solSignature || !ethers.isAddress(body?.gate) || !body?.chainId) return json(res, 400, { error: "missing solSignature / gate / chainId" });
+    const v = await verifySolSource(body);
+    if (!v?.ok) { stats.declined++; return json(res, 409, { error: `source deposit not verified: ${v?.reason || "unknown"}` }); }
+    const digest = solSourceDigest({ chainId: body.chainId, gate: ethers.getAddress(body.gate), ...v.facts });
+    const ethHash = ethers.hashMessage(ethers.getBytes(digest)); // the gate verifies EIP-191 over sourceDigest
+    const signature = await signer.signDigest(ethHash);
+    if (ethers.getAddress(ethers.recoverAddress(ethHash, signature)) !== signer.address) { stats.errors++; return json(res, 500, { error: "self-recovery mismatch" }); }
+    stats.attested++;
+    return json(res, 200, { validator: signer.address, signature, digest });
   }
 
   return { handler, stats, address: signer.address };
@@ -188,9 +208,11 @@ async function main() {
   // C-01 (v8): bind every signature to the source pool's expected-delivery commitment (pool address is
   // read from the attestor). Compatible with a pre-v8 pool (no commitment API → check skipped).
   const readExpectation = makeExpectationReader({ attestorAddress, provider: attestorProvider });
+  // v12 H-03: Solana source-deposit attestation (finalized observation) for the SOL → EVM inbound gates.
+  const verifySolSource = env.SOLANA_RPC ? makeSolSourceVerifier({ solanaRpc: env.SOLANA_RPC, depositAccount: env.SOL_DEPOSIT_ACCOUNT || undefined }) : null;
   const port = Number(env.PORT || 8800);
   const { url, address } = await startValidatorService(
-    { signer, attestorAddress, attestorProvider, verifyDelivery, readExpectation, authToken: env.VALIDATOR_AUTH_TOKEN },
+    { signer, attestorAddress, attestorProvider, verifyDelivery, readExpectation, authToken: env.VALIDATOR_AUTH_TOKEN, verifySolSource },
     port,
     env.HOST || "0.0.0.0",
   );
